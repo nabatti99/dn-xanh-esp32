@@ -1,14 +1,9 @@
-/*********
-  Rui Santos & Sara Santos - Random Nerd Tutorials
-  Complete instructions at https://RandomNerdTutorials.com/esp32-websocket-server-sensor/
-  Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files.
-  The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-*********/
 #include <Arduino.h>
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <Arduino_JSON.h>
+#include <HTTPClient.h>
 
 // Define pins
 #define DOOR_ECHO_PIN 23
@@ -16,19 +11,23 @@
 #define SOUND_ECHO_PIN 18
 
 // Constants
+const String EMBEDDED_SYSTEM_ID = "DN-SMT-001_RECYCLABLE";
+const String WASTE_TYPE = "RECYCLABLE";
 enum State {IDLE, OPENING_DOOR, COLLECTING_DATA, SERVER_PROCESSING, CLAIM_REWARD};
-const String WASTE_TYPE = "RECYCLE";
 const double SOUND_SPEED = 0.034;
 const unsigned long TIMEOUT = 30000;
+const String SERVER_BASE_URL = "http://api.danangxanh.top/api";
 
-// Replace with your network credentials
-const char* ssid = "minh_nguyenanh";
-const char* password = "123456789";
+// Wifi config
+const char* SSID = "minh_nguyenanh";
+const char* PASSWORD = "123456789";
 
-// Set your Static IP config
+// Static IP config
 IPAddress localIP(192, 168, 137, 20);
 IPAddress gateway(192, 168, 137, 1);
 IPAddress subnet(255, 255, 255, 0);
+IPAddress primaryDNS(8, 8, 8, 8);
+IPAddress secondaryDNS(8, 8, 4, 4);
 
 // Create AsyncWebServer object on port 80
 AsyncWebServer server(80);
@@ -77,7 +76,7 @@ void WiFiStationDisconnected(WiFiEvent_t event, WiFiEventInfo_t info){
   Serial.print("WiFi lost connection. Reason: ");
   Serial.println(info.wifi_sta_disconnected.reason);
   Serial.println("Trying to Reconnect");
-  WiFi.begin(ssid, password);
+  WiFi.begin(SSID, PASSWORD);
 }
 
 // Initialize WiFi
@@ -94,11 +93,11 @@ void initWiFi() {
   // WiFi.mode(WIFI_STA);
 
   // Static IP
-  if (!WiFi.config(localIP, gateway, subnet)) {
+  if (!WiFi.config(localIP, gateway, subnet, primaryDNS, secondaryDNS)) {
     Serial.println("STA Failed to configure");
   }
 
-  WiFi.begin(ssid, password);
+  WiFi.begin(SSID, PASSWORD);
   Serial.println("Connecting to WiFi ...");
 }
 
@@ -150,24 +149,112 @@ void setup() {
 
   // Web Server Root URL
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/plain", "Hello World!");
+    request->send(200, "text/plain", "DN Xanh Embedded System: " + EMBEDDED_SYSTEM_ID);
   });
 
   // Start server
   server.begin();
 }
 
-void sendMessage(String message) {
+void sendMessage(const String message) {
   ws.text(currentClientId, message);
   Serial.println(message);
 }
 
-void sendError(String error) {
+void sendError(const String error) {
   JSONVar responseData;
   responseData["type"] = "ERROR";
-  responseData["state"] = error;
+  responseData["message"] = error;
   String jsonresponseData = JSON.stringify(responseData);
   sendMessage(jsonresponseData);
+}
+
+int requestGet(const String path, JSONVar& responseObj) {
+  // Verify wifi connection
+  if (isConnectedToWifi) {
+    HTTPClient http;
+
+    // configure traged server and url
+    String url = SERVER_BASE_URL + path;
+    http.begin(url.c_str());  //HTTP
+
+    // start connection and send HTTP header
+    int httpCode = http.GET();
+
+    // httpCode will be negative on error
+    if (httpCode == 200) {
+      String responseJson = http.getString();
+      responseObj = JSON.parse(responseJson);
+
+      if (JSON.typeof(responseObj) == "undefined") {
+        Serial.println("[HTTP] GET: Parsing response failed!");
+        return -1;
+      }
+    } else {
+      Serial.printf("[HTTP] GET: failed, error: %s\n", http.errorToString(httpCode).c_str());
+    }
+
+    http.end();
+
+    return httpCode;
+  } 
+  
+  return -1;
+}
+
+bool requestPost(const String path, const String bodyJson, JSONVar& responseObj) {
+  bool result = true;
+
+  // Verify wifi connection
+  if (isConnectedToWifi) {
+    HTTPClient http;
+
+    // configure traged server and url
+    String url = SERVER_BASE_URL + path;
+    http.begin(url.c_str());  //HTTP
+
+    // Add headers
+    http.addHeader("Content-Type", "application/json");
+
+    // start connection and send HTTP header
+    Serial.println(bodyJson);
+    int httpCode = http.POST(bodyJson);
+
+
+    // httpCode will be negative on error
+    if (httpCode > 0) {
+      // // HTTP header has been send and Server response header has been handled
+      // Serial.printf("[HTTP] POST... code: %d\n", httpCode);
+
+      if (httpCode == 201) {
+        String responseJson = http.getString();
+        responseObj = JSON.parse(responseJson);
+
+        if (JSON.typeof(responseObj) == "undefined") {
+          Serial.println("[HTTP] POST: Parsing response failed!");
+          sendError("Có lỗi xảy ra");
+          setState(IDLE);
+          result = false;
+        }
+      } else {
+        Serial.printf("[HTTP] POST: failed, error: %s\n", http.errorToString(httpCode).c_str());
+        sendError("Có lỗi xảy ra");
+        setState(IDLE);
+        result = false;
+      }
+    } else {
+      Serial.printf("[HTTP] POST: failed, error: %s\n", http.errorToString(httpCode).c_str());
+      sendError("Không thể gửi dữ liệu đến server trung tâm");
+      setState(IDLE);
+      result = false;
+    }
+
+    http.end();
+  } else {
+    result = false;
+  }
+
+  return result;
 }
 
 void setState(State newState) {
@@ -216,6 +303,7 @@ void breakLoop() {
 void loop() {
   static unsigned long beginTime = 0;
   static double previousHeight = 0;
+  static String smartRecycleBinClassificationHistoryId = "";
 
   // Verify wifi connection
   if (!isConnectedToWifi) return breakLoop();
@@ -259,44 +347,66 @@ void loop() {
   }
 
   if (state == COLLECTING_DATA) {
-    double sumHeightDelta = 0;
+    double sumHeight = 0;
     for (int i = 0; i < 5; ++i) {
       // Capture image
       // Calculate height
       height = getHeight();
-      double heightDelta = abs(height - previousHeight);
-      sumHeightDelta += heightDelta;
+      sumHeight += height;
       delay(200);
     }
-    double avgHeightDelta = sumHeightDelta / 5;
+    double avgHeight = sumHeight / 5;
 
     // Send to server
     setState(SERVER_PROCESSING);
 
-    JSONVar serverRequestData;
-    serverRequestData["heightDelta"] = avgHeightDelta;
-    String jsonServerRequestData = JSON.stringify(serverRequestData);
+    JSONVar classifyRequestData;
+    classifyRequestData["volume"] = avgHeight;
+    classifyRequestData["embeddedSystemId"] = EMBEDDED_SYSTEM_ID;
+    classifyRequestData["wasteType"] = WASTE_TYPE; // TODO: Need change
 
-    // Receive prediction
-    // Send to build QR
+    JSONVar classifyResponseData;
+    if (!requestPost("/smart-recycle-bin/classify", JSON.stringify(classifyRequestData), classifyResponseData)) return breakLoop();
+
+    smartRecycleBinClassificationHistoryId = String(classifyResponseData["smartRecycleBinClassificationHistoryId"]);
+    bool isCorrect = (bool) classifyResponseData["isCorrect"];
+    String token = classifyResponseData["token"];
+
+    if (!isCorrect) {
+      sendError("Phân loại rác chưa đúng");
+      setState(IDLE);
+    }
 
     JSONVar responseData;
     responseData["type"] = "BUILD_QR";
-    responseData["height"] = avgHeightDelta;
-    responseData["wasteType"] = WASTE_TYPE;
-    responseData["predictWasteType"] = "RECYCLE";
-    responseData["predictAccuracy"] = 0.82;
+    responseData["isCorrect"] = isCorrect;
+    responseData["token"] = token;
     String jsonresponseData = JSON.stringify(responseData);
     sendMessage(jsonresponseData);
 
     setState(CLAIM_REWARD);
   }
 
+  if (state == CLAIM_REWARD) {
+    JSONVar checkClaimRequestData;
+    checkClaimRequestData["smartRecycleBinClassificationHistoryId"] = smartRecycleBinClassificationHistoryId;
+
+    JSONVar checkClaimResponseData;
+    bool isRequestedSuccess = requestPost("/smart-recycle-bin/check-claim-reward", JSON.stringify(checkClaimRequestData), checkClaimResponseData);
+    if (isRequestedSuccess) {
+      bool isClaimed = checkClaimResponseData["isClaimed"];
+      if (isClaimed) {
+        sendMessage("Cảm ơn đã sử dụng thùng rác thông minh!");
+        setState(IDLE);
+      }
+    }
+  }
+
   if (state != IDLE) {
     // Check timeout
     unsigned long processingTimeConsumed = millis() - beginTime;
     if (processingTimeConsumed > TIMEOUT) {
-      sendError("Timeout");
+      sendError("Hệ thống cảm biến không phản hồi");
       setState(IDLE);
 
       return breakLoop();
