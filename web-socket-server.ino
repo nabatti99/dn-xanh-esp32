@@ -17,6 +17,7 @@ enum State {IDLE, OPENING_DOOR, COLLECTING_DATA, SERVER_PROCESSING, CLAIM_REWARD
 const double SOUND_SPEED = 0.034;
 const unsigned long TIMEOUT = 30000;
 const String SERVER_BASE_URL = "http://api.danangxanh.top/api";
+const String CAMERA_BASE_URL = "http://192.168.137.21";
 
 // Wifi config
 const char* SSID = "minh_nguyenanh";
@@ -169,7 +170,9 @@ void sendError(const String error) {
   sendMessage(jsonresponseData);
 }
 
-int requestGet(const String path, JSONVar& responseObj) {
+bool requestGet(const String path, JSONVar& responseObj) {
+  bool result = true;
+
   // Verify wifi connection
   if (isConnectedToWifi) {
     HTTPClient http;
@@ -182,24 +185,37 @@ int requestGet(const String path, JSONVar& responseObj) {
     int httpCode = http.GET();
 
     // httpCode will be negative on error
-    if (httpCode == 200) {
-      String responseJson = http.getString();
-      responseObj = JSON.parse(responseJson);
+    if (httpCode > 0) {
+      if (httpCode == 200) {
+        String responseJson = http.getString();
+        responseObj = JSON.parse(responseJson);
 
-      if (JSON.typeof(responseObj) == "undefined") {
-        Serial.println("[HTTP] GET: Parsing response failed!");
-        return -1;
+        if (JSON.typeof(responseObj) == "undefined") {
+          Serial.println("[HTTP] GET: Parsing response failed!");
+          sendError("Có lỗi xảy ra");
+          result = false;
+        }
+      } else {
+        Serial.printf("[HTTP] GET: failed, error: %s\n", http.errorToString(httpCode).c_str());
+        sendError("Có lỗi xảy ra");
+        result = false;
       }
     } else {
       Serial.printf("[HTTP] GET: failed, error: %s\n", http.errorToString(httpCode).c_str());
+      sendError("Không thể gửi dữ liệu đến server trung tâm");
+      result = false;
     }
 
     http.end();
 
     return httpCode;
-  } 
-  
-  return -1;
+  } else {
+    result = false;
+  }
+
+  if (!result) setState(IDLE);
+
+  return result;
 }
 
 bool requestPost(const String path, const String bodyJson, JSONVar& responseObj) {
@@ -233,19 +249,16 @@ bool requestPost(const String path, const String bodyJson, JSONVar& responseObj)
         if (JSON.typeof(responseObj) == "undefined") {
           Serial.println("[HTTP] POST: Parsing response failed!");
           sendError("Có lỗi xảy ra");
-          setState(IDLE);
           result = false;
         }
       } else {
         Serial.printf("[HTTP] POST: failed, error: %s\n", http.errorToString(httpCode).c_str());
         sendError("Có lỗi xảy ra");
-        setState(IDLE);
         result = false;
       }
     } else {
       Serial.printf("[HTTP] POST: failed, error: %s\n", http.errorToString(httpCode).c_str());
       sendError("Không thể gửi dữ liệu đến server trung tâm");
-      setState(IDLE);
       result = false;
     }
 
@@ -253,6 +266,8 @@ bool requestPost(const String path, const String bodyJson, JSONVar& responseObj)
   } else {
     result = false;
   }
+
+  if (!result) setState(IDLE);
 
   return result;
 }
@@ -348,8 +363,18 @@ void loop() {
 
   if (state == COLLECTING_DATA) {
     double sumHeight = 0;
+    String wasteTypePredictions[5];
+    JSONVar wasteTypePredictionsCount;
     for (int i = 0; i < 5; ++i) {
-      // Capture image
+      // Capture & classify image
+      JSONVar captureAndClassifyResponseData;
+      if (!requestGet("/smart-recycle-bin/capture-and-classify", captureAndClassifyResponseData)) return breakLoop();
+      String wasteTypePrediction = captureAndClassifyResponseData["wasteTypePrediction"];
+
+      wasteTypePredictions[i] = wasteTypePrediction;
+      if (JSON.typeof(wasteTypePredictionsCount[wasteTypePrediction]) == "undefined") wasteTypePredictionsCount[wasteTypePrediction] = 1;
+      else wasteTypePredictionsCount[wasteTypePrediction] = ((int) wasteTypePredictionsCount[wasteTypePrediction]) + 1;
+
       // Calculate height
       height = getHeight();
       sumHeight += height;
@@ -357,13 +382,21 @@ void loop() {
     }
     double avgHeight = sumHeight / 5;
 
+    // Get highest wasteType prediction
+    String highestWasteTypePrediction;
+    for (int i = 0; i < 5; ++i) {
+      String wasteTypePrediction = wasteTypePredictions[i];
+      if ((int) wasteTypePredictionsCount[wasteTypePrediction] > (int) wasteTypePredictionsCount[highestWasteTypePrediction])
+        highestWasteTypePrediction = wasteTypePrediction;
+    }
+
     // Send to server
     setState(SERVER_PROCESSING);
 
     JSONVar classifyRequestData;
     classifyRequestData["volume"] = avgHeight;
     classifyRequestData["embeddedSystemId"] = EMBEDDED_SYSTEM_ID;
-    classifyRequestData["wasteType"] = WASTE_TYPE; // TODO: Need change
+    classifyRequestData["wasteType"] = highestWasteTypePrediction;
 
     JSONVar classifyResponseData;
     if (!requestPost("/smart-recycle-bin/classify", JSON.stringify(classifyRequestData), classifyResponseData)) return breakLoop();
@@ -406,7 +439,7 @@ void loop() {
     // Check timeout
     unsigned long processingTimeConsumed = millis() - beginTime;
     if (processingTimeConsumed > TIMEOUT) {
-      sendError("Hệ thống cảm biến không phản hồi");
+      sendError("Đã quá thời gian chờ");
       setState(IDLE);
 
       return breakLoop();
