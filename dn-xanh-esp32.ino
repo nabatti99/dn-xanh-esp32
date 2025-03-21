@@ -11,20 +11,21 @@
 #define SOUND_ECHO_PIN 18
 
 // Constants
-const String EMBEDDED_SYSTEM_ID = "DN-SMT-001_RECYCLABLE";
-const String WASTE_TYPE = "RECYCLABLE";
-enum State {IDLE, OPENING_DOOR, COLLECTING_DATA, SERVER_PROCESSING, CLAIM_REWARD};
+const String EMBEDDED_SYSTEM_ID = "DN-SMT-001_RECYCLABLE"; // Change it
+const String WASTE_TYPE = "RECYCLABLE"; // Change it
+enum State {IDLE, WAITING_FOR_OPEN_DOOR, OPENING_DOOR, COLLECTING_DATA, SERVER_PROCESSING, CLAIM_REWARD, REQUESTING_FINISH};
 const double SOUND_SPEED = 0.034;
 const unsigned long TIMEOUT = 30000;
 const String SERVER_BASE_URL = "http://api.danangxanh.top/api";
-const String CAMERA_BASE_URL = "http://192.168.137.21";
+const String CAMERA_BASE_URL = "http://192.168.137.21"; // Change it
+const String FRONT_ESP32_URL = "http://192.168.137.100"
 
 // Wifi config
 const char* SSID = "minh_nguyenanh";
 const char* PASSWORD = "123456789";
 
 // Static IP config
-IPAddress localIP(192, 168, 137, 20);
+IPAddress localIP(192, 168, 137, 20); // Change it
 IPAddress gateway(192, 168, 137, 1);
 IPAddress subnet(255, 255, 255, 0);
 IPAddress primaryDNS(8, 8, 8, 8);
@@ -153,6 +154,11 @@ void setup() {
     request->send(200, "text/plain", "DN Xanh Embedded System: " + EMBEDDED_SYSTEM_ID);
   });
 
+  server.on("/request-open-door", HTTP_POST, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", "OK");
+    setState(WAITING_FOR_OPEN_DOOR);
+  });
+
   // Start server
   server.begin();
 }
@@ -166,11 +172,11 @@ void sendError(const String error) {
   JSONVar responseData;
   responseData["type"] = "ERROR";
   responseData["message"] = error;
-  String jsonresponseData = JSON.stringify(responseData);
-  sendMessage(jsonresponseData);
+  String jsonResponseData = JSON.stringify(responseData);
+  sendMessage(jsonResponseData);
 }
 
-bool requestGet(const String path, JSONVar& responseObj) {
+bool requestGet(const String serverBaseUrl, const String path, JSONVar& responseObj) {
   bool result = true;
 
   // Verify wifi connection
@@ -178,7 +184,7 @@ bool requestGet(const String path, JSONVar& responseObj) {
     HTTPClient http;
 
     // configure traged server and url
-    String url = SERVER_BASE_URL + path;
+    String url = serverBaseUrl + path;
     http.begin(url.c_str());  //HTTP
 
     // start connection and send HTTP header
@@ -218,7 +224,7 @@ bool requestGet(const String path, JSONVar& responseObj) {
   return result;
 }
 
-bool requestPost(const String path, const String bodyJson, JSONVar& responseObj) {
+bool requestPost(const String serverBaseUrl, const String path, const String bodyJson, JSONVar& responseObj) {
   bool result = true;
 
   // Verify wifi connection
@@ -226,7 +232,7 @@ bool requestPost(const String path, const String bodyJson, JSONVar& responseObj)
     HTTPClient http;
 
     // configure traged server and url
-    String url = SERVER_BASE_URL + path;
+    String url = serverBaseUrl + path;
     http.begin(url.c_str());  //HTTP
 
     // Add headers
@@ -278,8 +284,8 @@ void setState(State newState) {
   JSONVar responseData;
   responseData["type"] = "SET_STATE";
   responseData["state"] = stateToString(newState);
-  String jsonresponseData = JSON.stringify(responseData);
-  sendMessage(jsonresponseData);
+  String jsonResponseData = JSON.stringify(responseData);
+  sendMessage(jsonResponseData);
 }
 
 bool checkDoor() {
@@ -318,7 +324,7 @@ void breakLoop() {
 void loop() {
   static unsigned long beginTime = 0;
   static double previousHeight = 0;
-  static String smartRecycleBinClassificationHistoryId = "";
+  static String smartRecycleBinSubmissionHistoryId = "";
 
   // Verify wifi connection
   if (!isConnectedToWifi) return breakLoop();
@@ -331,6 +337,7 @@ void loop() {
     return breakLoop();
   } 
   
+  // Get sensors data
   bool isDoorOpened = checkDoor();
   double height = getHeight();
 
@@ -343,21 +350,25 @@ void loop() {
   sendMessage(jsonSensorData);
 
   // Check door
-  if (isDoorOpened && state != OPENING_DOOR) {
+  if (isDoorOpened && state != WAITING_FOR_OPEN_DOOR) {
     setState(OPENING_DOOR);
     beginTime = millis();
-
     return breakLoop();
   }
 
   if (state == IDLE) {
-    previousHeight = height;
+    beginTime = millis();
+    return breakLoop();
   }
 
-  if (state == OPENING_DOOR && !isDoorOpened) {
+  if (state == WAITING_FOR_OPEN_DOOR) {
+    previousHeight = height;
+    return breakLoop();
+  }
+
+  if (state == WAITING_FOR_OPEN_DOOR && !isDoorOpened) {
     setState(COLLECTING_DATA);
     beginTime = millis();
-
     return breakLoop();
   }
 
@@ -366,73 +377,58 @@ void loop() {
     String wasteTypePredictions[5];
     JSONVar wasteTypePredictionsCount;
     for (int i = 0; i < 5; ++i) {
-      // Capture & classify image
-      JSONVar captureAndClassifyResponseData;
-      if (!requestGet("/smart-recycle-bin/capture-and-classify", captureAndClassifyResponseData)) return breakLoop();
-      String wasteTypePrediction = captureAndClassifyResponseData["wasteTypePrediction"];
-
-      wasteTypePredictions[i] = wasteTypePrediction;
-      if (JSON.typeof(wasteTypePredictionsCount[wasteTypePrediction]) == "undefined") wasteTypePredictionsCount[wasteTypePrediction] = 1;
-      else wasteTypePredictionsCount[wasteTypePrediction] = ((int) wasteTypePredictionsCount[wasteTypePrediction]) + 1;
-
       // Calculate height
       height = getHeight();
       sumHeight += height;
-      delay(200);
+
+      delay(100);
     }
     double avgHeight = sumHeight / 5;
 
-    // Get highest wasteType prediction
-    String highestWasteTypePrediction;
-    for (int i = 0; i < 5; ++i) {
-      String wasteTypePrediction = wasteTypePredictions[i];
-      if ((int) wasteTypePredictionsCount[wasteTypePrediction] > (int) wasteTypePredictionsCount[highestWasteTypePrediction])
-        highestWasteTypePrediction = wasteTypePrediction;
-    }
-
     // Send to server
     setState(SERVER_PROCESSING);
+    beginTime = millis();
 
-    JSONVar classifyRequestData;
-    classifyRequestData["volume"] = avgHeight;
-    classifyRequestData["embeddedSystemId"] = EMBEDDED_SYSTEM_ID;
-    classifyRequestData["wasteType"] = highestWasteTypePrediction;
+    JSONVar submitRequestData;
+    submitRequestData["volume"] = avgHeight;
+    submitRequestData["embeddedSystemId"] = EMBEDDED_SYSTEM_ID;
 
-    JSONVar classifyResponseData;
-    if (!requestPost("/smart-recycle-bin/classify", JSON.stringify(classifyRequestData), classifyResponseData)) return breakLoop();
+    JSONVar submitResponseData;
+    if (!requestPost(SERVER_BASE_URL, "/smart-recycle-bin/submit", JSON.stringify(submitRequestData), submitResponseData)) return breakLoop();
 
-    smartRecycleBinClassificationHistoryId = String(classifyResponseData["smartRecycleBinClassificationHistoryId"]);
-    bool isCorrect = (bool) classifyResponseData["isCorrect"];
-    String token = classifyResponseData["token"];
-
-    if (!isCorrect) {
-      sendError("Phân loại rác chưa đúng");
-      setState(IDLE);
-    }
+    smartRecycleBinSubmissionHistoryId = String(submitResponseData["smartRecycleBinSubmissionHistoryId"]);
+    String token = submitResponseData["token"];
 
     JSONVar responseData;
     responseData["type"] = "BUILD_QR";
     responseData["isCorrect"] = isCorrect;
     responseData["token"] = token;
-    String jsonresponseData = JSON.stringify(responseData);
-    sendMessage(jsonresponseData);
+    String jsonResponseData = JSON.stringify(responseData);
+    sendMessage(jsonResponseData);
 
     setState(CLAIM_REWARD);
+    beginTime = millis();
   }
 
   if (state == CLAIM_REWARD) {
     JSONVar checkClaimRequestData;
-    checkClaimRequestData["smartRecycleBinClassificationHistoryId"] = smartRecycleBinClassificationHistoryId;
+    checkClaimRequestData["smartRecycleBinSubmissionHistoryId"] = smartRecycleBinSubmissionHistoryId;
 
     JSONVar checkClaimResponseData;
-    bool isRequestedSuccess = requestPost("/smart-recycle-bin/check-claim-reward", JSON.stringify(checkClaimRequestData), checkClaimResponseData);
-    if (isRequestedSuccess) {
-      bool isClaimed = checkClaimResponseData["isClaimed"];
-      if (isClaimed) {
-        sendMessage("Cảm ơn đã sử dụng thùng rác thông minh!");
-        setState(IDLE);
-      }
+    if(!requestPost(SERVER_BASE_URL, "/smart-recycle-bin/check-claim-reward", JSON.stringify(checkClaimRequestData), checkClaimResponseData)) return breakLoop();
+    bool isClaimed = checkClaimResponseData["isClaimed"];
+    if (isClaimed) {
+      sendMessage("Cảm ơn đã sử dụng thùng rác thông minh!");
+      setState(REQUESTING_FINISH);
+      beginTime = millis();
     }
+  }
+
+  if (state == REQUESTING_FINISH) {
+    JSONVar openDoorResponseData;
+    if (requestPost(FRONT_ESP32_URL, "/finish-esp32-main", "", openDoorResponseData)) return breakLoop();
+    setState(IDLE);
+    beginTime = millis();
   }
 
   if (state != IDLE) {
